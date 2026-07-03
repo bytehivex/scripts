@@ -7,7 +7,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v1.1"
+SCRIPT_VERSION="v1.2"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
 # 当前正在执行的阶段名称，由 phase_start 维护，trap ERR 时一并打印，
@@ -129,6 +129,7 @@ usage() {
   --dry-run                        只打印动作，不执行修改。
   --yes                            非交互执行。仅在你确认控制台/SSH 应急入口可用时使用。
   --non-interactive                不询问，但没有 --yes 时仍会在最终确认处停止。
+  --version                        显示脚本版本。
   -h, --help                       显示帮助。
 
 安全边界：
@@ -359,15 +360,25 @@ validate_admin_pubkey() {
   fi
 }
 
-# 防锁死兜底：关闭密码登录时，必须至少保留一条可用的 key 登录通道
+# 防锁死兜底：任何会收窄 SSH 登录面的组合，都必须保留至少一条确定可用的登录通道。
 check_login_path_safety() {
-  if ! is_yes "$CONFIGURE_SSH" || ! is_yes "$DISABLE_SSH_PASSWORD"; then
+  if ! is_yes "$CONFIGURE_SSH"; then
     return
   fi
 
   local admin_key_ok=0
-  if is_yes "$CREATE_ADMIN_USER" && is_yes "$CONFIGURE_ADMIN_KEY" && [ -n "$ADMIN_SSH_PUBKEY" ]; then
+  if is_yes "$CONFIGURE_ADMIN_KEY" && [ -n "$ADMIN_SSH_PUBKEY" ] \
+    && { is_yes "$CREATE_ADMIN_USER" || id "$ADMIN_USER" >/dev/null 2>&1; }; then
     admin_key_ok=1
+  fi
+  # 管理用户已存在且自带 authorized_keys，也算可用通道（本次不新写 key 的场景）
+  if [ "$admin_key_ok" -ne 1 ] && [ "$DRY_RUN" -ne 1 ] && id "$ADMIN_USER" >/dev/null 2>&1; then
+    local admin_home=""
+    admin_home="$(getent passwd "$ADMIN_USER" 2>/dev/null | cut -d: -f6)" || admin_home=""
+    if [ -n "$admin_home" ] && [ -s "$admin_home/.ssh/authorized_keys" ] \
+      && grep -qE '(ssh-(rsa|ed25519|dss)|ecdsa-sha2|sk-(ssh|ecdsa))' "$admin_home/.ssh/authorized_keys" 2>/dev/null; then
+      admin_key_ok=1
+    fi
   fi
 
   local root_key_ok=0
@@ -381,15 +392,30 @@ check_login_path_safety() {
     fi
   fi
 
-  if [ "$admin_key_ok" -ne 1 ] && [ "$root_key_ok" -ne 1 ]; then
-    die "已选择禁用 SSH 密码登录，但没有任何可用的 key 登录通道，继续会锁死自己。请任选其一修复：
+  # 场景一：禁用密码登录后，必须有 key 通道（管理用户或 root 任一）。
+  if is_yes "$DISABLE_SSH_PASSWORD"; then
+    if [ "$admin_key_ok" -ne 1 ] && [ "$root_key_ok" -ne 1 ]; then
+      die "已选择禁用 SSH 密码登录，但没有任何可用的 key 登录通道，继续会锁死自己。请任选其一修复：
   - 提供管理用户公钥：--admin-ssh-pubkey '<your-pubkey>'（并保持创建管理用户与写入 key）；
   - 保留 root key 登录：--keep-root-key-login yes，且确保 /root/.ssh/authorized_keys 已有有效公钥；
   - 暂不禁用密码登录：--disable-ssh-password no。"
+    fi
+    if [ "$admin_key_ok" -ne 1 ] && [ "$root_key_ok" -eq 1 ]; then
+      warn "未配置管理用户 SSH 公钥，禁用密码登录后将仅能通过 root key 登录。建议尽快为管理用户配置公钥。"
+    fi
   fi
 
-  if [ "$admin_key_ok" -ne 1 ] && [ "$root_key_ok" -eq 1 ]; then
-    warn "未配置管理用户 SSH 公钥，禁用密码登录后将仅能通过 root key 登录。建议尽快为管理用户配置公钥。"
+  # 场景二：完全禁止 root 登录（PermitRootLogin no）时，管理用户必须有确定可用的 key 通道。
+  # 即使密码登录保持开启也不能放行：adduser --disabled-password 创建的用户没有密码，
+  # "密码登录开着"不等于"有人能用密码登进来"，该组合同样会锁死。
+  if ! is_yes "$KEEP_ROOT_KEY_LOGIN" && [ "$admin_key_ok" -ne 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      warn "dry-run：--keep-root-key-login no 时 root 将无法 SSH 登录，请确保管理用户 $ADMIN_USER 有可用的 key 登录通道。"
+    else
+      die "--keep-root-key-login no 会完全禁止 root SSH 登录，但管理用户 $ADMIN_USER 没有确定可用的 key 登录通道，继续会锁死自己。请任选其一修复：
+  - 提供管理用户公钥：--admin-ssh-pubkey '<your-pubkey>'；
+  - 保留 root key 登录：--keep-root-key-login yes。"
+    fi
   fi
 }
 
@@ -494,6 +520,10 @@ parse_args() {
       --non-interactive)
         INTERACTIVE=0
         shift
+        ;;
+      --version)
+        printf '%s\n' "$SCRIPT_VERSION"
+        exit 0
         ;;
       -h|--help)
         usage
@@ -656,7 +686,7 @@ interactive_config() {
 
   ask_bool CONFIGURE_TIMEZONE "是否设置时区为 $TIMEZONE" "$CONFIGURE_TIMEZONE"
   ask_bool RUN_APT_UPDATE "是否执行 apt update" "$RUN_APT_UPDATE"
-  ask_bool RUN_APT_UPGRADE "是否执行 apt upgrade" "$RUN_APT_UPGRADE"
+  ask_bool RUN_APT_UPGRADE "是否执行 apt full-upgrade" "$RUN_APT_UPGRADE"
   ask_bool INSTALL_BASIC_PACKAGES "是否安装基础工具包" "$INSTALL_BASIC_PACKAGES"
   ask_bool CONFIGURE_SECURITY_UPDATES "是否配置 unattended-upgrades 仅自动安装安全更新" "$CONFIGURE_SECURITY_UPDATES"
   ask_bool REBOOT_IF_REQUIRED "如果系统提示需要重启，是否立即重启" "$REBOOT_IF_REQUIRED"
@@ -1020,12 +1050,17 @@ install_packages() {
     run apt-get update
   fi
   if is_yes "$RUN_APT_UPGRADE"; then
-    info "执行 apt upgrade"
-    run env DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
+    # dist-upgrade 等价于 apt full-upgrade，与初始化 SOP 口径一致：
+    # 干净系统初始化阶段允许为完成升级安装/移除依赖（例如新内核）。
+    info "执行 apt full-upgrade"
+    run env DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade
   fi
   if is_yes "$INSTALL_BASIC_PACKAGES"; then
     info "安装基础工具包"
     run env DEBIAN_FRONTEND=noninteractive apt-get -y install "${BASIC_PACKAGES[@]}"
+    # chrony 随基础包安装，这里显式启用，保证时间同步生效（幂等）。
+    info "启用 chrony 时间同步"
+    run systemctl enable --now chrony
   fi
 }
 
@@ -1251,6 +1286,12 @@ firewall_open_ports() {
   run ip6tables -F INPUT
   add_ip6tables_rule -i lo -j ACCEPT
   add_ip6tables_rule -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+  # Tailscale 同时使用 IPv6（fd7a:115c:a1e0::/48）；只放行 v4 会让后手通道在
+  # v6 INPUT DROP 收紧后半残，因此 v4/v6 同步放行 tailscale0。
+  if is_yes "$ALLOW_TAILSCALE"; then
+    add_ip6tables_rule -i tailscale0 -j ACCEPT
+  fi
 
   # 阶段一不设 INPUT DROP，保持 ACCEPT，给后续 SSH 验证留安全窗口
   run netfilter-persistent save
@@ -1651,7 +1692,6 @@ EOF
 }
 
 main() {
-  phase_start "parse-args"
   parse_args "$@"
   phase_start "require-root"
   require_root

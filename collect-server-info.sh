@@ -6,10 +6,14 @@
 
 set -u
 
-SCRIPT_VERSION="v1.1"
+SCRIPT_VERSION="v1.2"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 # 固定为 C locale，让不同机器的工具输出格式稳定、便于横向对比（不影响脚本内中文字面）
 export LC_ALL=C
+# 单条采集命令的超时秒数，防止 docker daemon 卡死、journalctl 扫大日志等场景挂起整个采集。
+# 可用环境变量覆盖：COLLECT_CMD_TIMEOUT=120 ./collect-server-info.sh ...
+CMD_TIMEOUT="${COLLECT_CMD_TIMEOUT:-60}"
+TIMEOUT_BIN=""
 SERVER_ID=""
 OUTPUT_DIR="./server-info-reports"
 MASK_SENSITIVE=1
@@ -31,7 +35,11 @@ usage() {
   --include-network-probe   执行轻量外部网络探测：公网 IP、DNS、ping。默认关闭。
   --no-mask                 不脱敏公网 IP、MAC、Machine ID 等信息。仅限私有保存报告时使用。
   --interactive             交互式填写 server-id、输出目录和外部探测选项。
+  --version                 显示脚本版本。
   -h, --help                显示帮助。
+
+环境变量：
+  COLLECT_CMD_TIMEOUT       单条采集命令的超时秒数，默认 60。命令超时会记录退出码 124 并继续采集。
 
 安全边界：
   - 脚本只读采集，不安装软件、不修改配置、不重启服务。
@@ -93,6 +101,10 @@ parse_args() {
         INTERACTIVE=1
         shift
         ;;
+      --version)
+        printf '%s\n' "$SCRIPT_VERSION"
+        exit 0
+        ;;
       -h|--help)
         usage
         exit 0
@@ -141,8 +153,9 @@ redact_stream() {
     return
   fi
 
-  if command -v perl >/dev/null 2>&1; then
-    perl -pe '
+  # main() 已保证开启脱敏时 perl 必然存在；不提供弱化的 sed 降级，
+  # 避免将来逻辑变动时静默降级成"看起来脱敏了、实际没脱干净"。
+  perl -pe '
       s#\b([a-z][a-z0-9+.-]*://)(?:[^/\s:@]+(?::[^/\s@]*)?|:[^/\s@]+)@#${1}[redacted-credential]@#ig;
       s/\b((?:authorization)\s*:\s*(?:bearer|basic)\s+)["\x27]?[^\s"\x27&;]+/${1}[redacted]/ig;
       s/\b((?:set-cookie|cookie)\s*:\s*)[^\r\n]+/${1}[redacted]/ig;
@@ -168,12 +181,6 @@ redact_stream() {
         }
       /gex;
     '
-  else
-    sed -E \
-      -e 's/(Machine ID:[[:space:]]*)[0-9a-f-]+/\1[redacted]/Ig' \
-      -e 's/(Boot ID:[[:space:]]*)[0-9a-f-]+/\1[redacted]/Ig' \
-      -e 's/([0-9a-f]{2}:){5}[0-9a-f]{2}/[redacted-mac]/Ig'
-  fi
 }
 
 append() {
@@ -205,17 +212,30 @@ code_end() {
   blank
 }
 
+# 带超时地执行单条采集命令。没有 timeout 命令时直接执行（脚本仍可用，只是失去防挂起保护）。
+run_with_timeout() {
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" "$CMD_TIMEOUT" bash -c "$1"
+  else
+    bash -c "$1"
+  fi
+}
+
 run_cmd() {
   local title="$1"
   local cmd="$2"
+  local status=0
   subsection "$title"
   append "命令：\`$cmd\`"
   blank
   code_start
-  bash -c "$cmd" 2>&1 | redact_stream >> "$REPORT_FILE"
-  local status=${PIPESTATUS[0]}
+  run_with_timeout "$cmd" 2>&1 | redact_stream >> "$REPORT_FILE"
+  status=${PIPESTATUS[0]}
   code_end
-  if [ "$status" -ne 0 ]; then
+  if [ "$status" -eq 124 ] && [ -n "$TIMEOUT_BIN" ]; then
+    append "> 命令超过 ${CMD_TIMEOUT}s 被终止（退出码 124），采集继续。"
+    blank
+  elif [ "$status" -ne 0 ]; then
     append "> 命令退出码：$status"
     blank
   fi
@@ -477,6 +497,18 @@ main() {
     log "错误：默认脱敏需要 perl，但当前系统未找到 perl。"
     log "请安装 perl 后重试；或确认报告只保存在私有位置后使用 --no-mask。"
     exit 1
+  fi
+
+  case "$CMD_TIMEOUT" in
+    ''|*[!0-9]*)
+      log "错误：COLLECT_CMD_TIMEOUT 必须是正整数秒数，当前值：$CMD_TIMEOUT"
+      exit 2
+      ;;
+  esac
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="$(command -v timeout)"
+  else
+    log "警告：未找到 timeout 命令，单条命令超时保护不可用；个别命令挂起会阻塞采集。"
   fi
 
   case "$(uname -s 2>/dev/null || printf 'unknown')" in
